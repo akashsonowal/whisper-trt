@@ -39,7 +39,7 @@ class TritonPythonModel:
         self.eos = self.tokenizer.encode(
             "<|endoftext|>",
             allowed_special=self.tokenizer.special_tokens_set)[0]
-        self.device = torch.device("cuda")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.decoupled = pb_utils.using_decoupled_model_transaction_policy(
             self.model_config)
         self.logger = pb_utils.Logger
@@ -90,6 +90,8 @@ class TritonPythonModel:
             "input_lengths": mel_len,
             "decoder_input_ids": prompt,
             "streaming": np.array([[self.decoupled]], dtype=np.bool_),
+            # Ask TRT-LLM to return token-level log-probabilities
+            "return_log_probs": np.array([[True]], dtype=np.bool_),
         }
         input_tensor_list = [
             pb_utils.Tensor(k, v) for k, v in input_dict.items()
@@ -127,7 +129,7 @@ class TritonPythonModel:
         """
         llm_request = pb_utils.InferenceRequest(
             model_name="tensorrt_llm",
-            requested_output_names=["output_ids", "sequence_length"],
+            requested_output_names=["output_ids", "sequence_length", "output_log_probs", "cum_log_probs"],
             inputs=llm_request_inputs,
         )
         responses = llm_request.exec(decoupled=self.decoupled)
@@ -136,18 +138,35 @@ class TritonPythonModel:
             if llm_response.has_error():
                 raise pb_utils.TritonModelException(
                     llm_response.error().message())
-            output_ids = (pb_utils.get_output_tensor_by_name(
+            
+            output_token_ids = (pb_utils.get_output_tensor_by_name(
                 llm_response, "output_ids").as_numpy().flatten().tolist())
+            output_log_probs = pb_utils.get_output_tensor_by_name(
+                llm_response, "output_log_probs").as_numpy()
+            cum_log_probs = pb_utils.get_output_tensor_by_name(
+                llm_response, "cum_log_probs").as_numpy()
 
-            output_text = self.tokenizer.decode(output_ids).strip()
+            output_text = self.tokenizer.decode(output_token_ids).strip()
             output_text = re.sub(r'<\|.*?\|>', '', output_text)
-            response = pb_utils.InferenceResponse(output_tensors=[
-                pb_utils.Tensor("TRANSCRIPTS",
-                                np.array([output_text], np.object_)),
-            ])
+
+            # Ensure correct shapes and data types
+            output_token_ids_array = np.array(output_token_ids, dtype=np.int32)
+            output_log_probs_flat = output_log_probs.flatten().astype(np.float32)
+            cum_log_probs_flat = cum_log_probs.flatten().astype(np.float32)
+
+            output_tensors = [
+                pb_utils.Tensor("TRANSCRIPTS", np.array([output_text], dtype=np.object_)),
+                pb_utils.Tensor("OUTPUT_TOKEN_IDS", output_token_ids_array),
+                pb_utils.Tensor("CUM_LOG_PROBS", np.expand_dims(cum_log_probs_flat, 0)),
+                pb_utils.Tensor("OUTPUT_LOG_PROBS", np.expand_dims(output_log_probs_flat, 0)), 
+            ]
+            response = pb_utils.InferenceResponse(output_tensors)
             yield response
         else:
-            output_ids = []
+            output_token_ids = []
+            output_log_probs_list = []
+            cum_log_probs_list = []
+
             for llm_response in responses:
                 if llm_response.has_error():
                     raise pb_utils.TritonModelException(
@@ -156,13 +175,42 @@ class TritonPythonModel:
                     llm_response, "output_ids").as_numpy().flatten().tolist())
                 if len(stream_output_ids) == 0:
                     continue
-                output_ids.extend(stream_output_ids)
-                output_text = self.tokenizer.decode(output_ids).strip()
+                output_token_ids.extend(stream_output_ids)
+
+                stream_log_probs = pb_utils.get_output_tensor_by_name(
+                    llm_response, "output_log_probs").as_numpy().flatten().tolist()
+                output_log_probs_list.extend(stream_log_probs)
+
+                # Try to get cum_log_probs if available in streaming mode
+                try:
+                    stream_cum_log_probs = pb_utils.get_output_tensor_by_name(
+                        llm_response, "cum_log_probs")
+                    if stream_cum_log_probs is not None:
+                        cum_log_probs_list.append(stream_cum_log_probs.as_numpy())
+                except:
+                    pass
+
+                output_text = self.tokenizer.decode(output_token_ids).strip()
                 output_text = re.sub(r'<\|.*?\|>', '', output_text)
-                response = pb_utils.InferenceResponse(output_tensors=[
-                    pb_utils.Tensor("TRANSCRIPTS",
-                                    np.array([output_text], np.object_)),
-                ])
+
+                # Ensure correct data types
+                output_token_ids_array = np.array(output_token_ids, dtype=np.int32)
+                output_log_probs_array = np.array(output_log_probs_list, dtype=np.float32)
+
+                output_tensors = [
+                    pb_utils.Tensor("TRANSCRIPTS", np.array([output_text], dtype=np.object_)),
+                    pb_utils.Tensor("OUTPUT_TOKEN_IDS", output_token_ids_array),
+                    pb_utils.Tensor("OUTPUT_LOG_PROBS", np.expand_dims(output_log_probs_array, 0)),
+                ]
+
+                # Add CUM_LOG_PROBS only if available
+                if cum_log_probs_list:
+                    cum_log_probs_array = np.concatenate(cum_log_probs_list, axis=0).astype(np.float32)
+                    output_tensors.append(
+                        pb_utils.Tensor("CUM_LOG_PROBS", np.expand_dims(cum_log_probs_array.flatten(), 0))
+                    )
+
+                response = pb_utils.InferenceResponse(output_tensors=output_tensors)
                 yield response
 
     def execute(self, requests):
@@ -182,23 +230,30 @@ class TritonPythonModel:
 
             wav = pb_utils.get_input_tensor_by_name(request, "WAV").as_numpy()
             assert wav.shape[0] == 1, "Only support batch size 1"
-            # To support batch > 1
-            # cat mel,text_prompt, also, need to increase decoder_input_len as a triton input
             wav = torch.from_numpy(wav[0]).to(self.device)
-            wav_len = pb_utils.get_input_tensor_by_name(
-                request, "WAV_LENS").as_numpy().item()
+            
+            # Handle optional WAV_LENS input
+            wav_lens_tensor = pb_utils.get_input_tensor_by_name(
+                request, "WAV_LENS", optional=True)
+            if wav_lens_tensor is not None:
+                wav_len = wav_lens_tensor.as_numpy().item()
+            else:
+                wav_len = len(wav)
+            
             if self.zero_pad:
                 wav = wav[:wav_len]
                 target = 0
             else:
                 target = 3000
+            
             mel = self.feature_extractor.compute_feature(wav, target).transpose(
                 1, 2)
             mel_len = np.array([[mel.shape[1]]], dtype=np.int32)
+            
             if self.decoupled:
                 response_sender = request.get_response_sender()
+            
             try:
-
                 llm_request_inputs = self._prepare_inputs(
                     request, mel, mel_len, decoder_input_ids)
                 if isinstance(llm_request_inputs, pb_utils.TritonError):
@@ -209,6 +264,7 @@ class TritonPythonModel:
                             flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
                     else:
                         responses.append(error)
+                
                 llm_responses = self._prepare_llm_response(llm_request_inputs)
 
                 for triton_response in llm_responses:
