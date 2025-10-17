@@ -230,14 +230,11 @@ class TritonPythonModel:
 
             wav = pb_utils.get_input_tensor_by_name(request, "WAV").as_numpy()
             assert wav.shape[0] == 1, "Only support batch size 1"
+            # To support batch > 1
+            # cat mel,text_prompt, also, need to increase decoder_input_len as a triton input
             wav = torch.from_numpy(wav[0]).to(self.device)
-            wav_lens_tensor = pb_utils.get_input_tensor_by_name(
-                request, "WAV_LENS")
-            if wav_lens_tensor is not None:
-                wav_len = wav_lens_tensor.as_numpy().item()
-            else:
-                wav_len = len(wav)
-            
+            wav_len = pb_utils.get_input_tensor_by_name(
+                request, "WAV_LENS").as_numpy().item()
             if self.zero_pad:
                 wav = wav[:wav_len]
                 target = 0
@@ -247,10 +244,8 @@ class TritonPythonModel:
             mel = self.feature_extractor.compute_feature(wav, target).transpose(
                 1, 2)
             mel_len = np.array([[mel.shape[1]]], dtype=np.int32)
-            
             if self.decoupled:
                 response_sender = request.get_response_sender()
-            
             try:
                 llm_request_inputs = self._prepare_inputs(
                     request, mel, mel_len, decoder_input_ids)
@@ -262,7 +257,6 @@ class TritonPythonModel:
                             flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
                     else:
                         responses.append(error)
-                
                 llm_responses = self._prepare_llm_response(llm_request_inputs)
 
                 for triton_response in llm_responses:
