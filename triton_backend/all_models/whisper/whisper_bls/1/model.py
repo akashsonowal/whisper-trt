@@ -231,10 +231,8 @@ class TritonPythonModel:
             wav = pb_utils.get_input_tensor_by_name(request, "WAV").as_numpy()
             assert wav.shape[0] == 1, "Only support batch size 1"
             wav = torch.from_numpy(wav[0]).to(self.device)
-            
-            # Handle optional WAV_LENS input
             wav_lens_tensor = pb_utils.get_input_tensor_by_name(
-                request, "WAV_LENS", optional=True)
+                request, "WAV_LENS").as_numpy()
             if wav_lens_tensor is not None:
                 wav_len = wav_lens_tensor.as_numpy().item()
             else:
